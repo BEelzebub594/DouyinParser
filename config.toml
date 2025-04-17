@@ -1,0 +1,5 @@
+[DouyinParser]
+enable = true
+
+# 允许解析的群聊白名单
+allowed_groups = [""]
