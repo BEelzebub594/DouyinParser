@@ -18,7 +18,7 @@
 ```toml
 [DouyinParser]
 enable = true  # 是否启用插件
-allowed_groups = ["group_id1", "group_id2"]  # 允许使用插件的群组
+allowed_groups = ["group_id1@chatroom", "group_id2@chatroom"]  # 允许使用插件的群组
 ```
 
 ## 🚀 使用指南
