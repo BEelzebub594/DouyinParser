@@ -1,6 +1,6 @@
 # DouyinParser 插件
 
-这是一个为 XYBot 开发的 DouyinParser 插件，可以无需借用API实现本地解析抖音视频链接并发送视频卡片消息。
+这是一个为 XXXBot 开发的 DouyinParser 插件，可以无需借用API实现本地解析抖音视频链接并发送视频卡片消息。
 
 ## ✨ 功能特性
 - 解析抖音视频链接
