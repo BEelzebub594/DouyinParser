@@ -1,37 +1,47 @@
 # DouyinParser 插件
 
-这是一个为 XXXBot 开发的 DouyinParser 插件，可以无需借用API实现本地解析抖音视频链接并发送视频卡片消息。
+这是一个用于 869WXbot/XYBot 的抖音分享解析插件。
 
-## ✨ 功能特性
-- 解析抖音视频链接
-- 发送视频卡片消息
+## 功能
 
-## 🛠️ 安装方法
-1. 确保已安装 XYBot 框架
-2. 将插件文件夹复制到 `plugins/DouyinParser/` 目录下
-3. 创建配置文件 `plugins/DouyinParser/config.toml`
-4. 重启 XYBot 服务
+- 自动识别群聊中的抖音分享链接。
+- 视频作品：解析后发送抖音视频卡片。
+- 图文作品：解析后发送首图图片，并追加作者、文案和原始链接文本。
+- 支持 `allowed_groups = ["*"]` 或指定群聊白名单。
 
-## ⚙️ 配置说明
-在 `plugins/DouyinParser/config.toml` 中进行配置：
+## 配置
+
+在 `plugins/DouyinParser/config.toml` 中配置：
 
 ```toml
 [DouyinParser]
-enable = true  # 是否启用插件
-allowed_groups = ["group_id1@chatroom", "group_id2@chatroom"]  # 允许使用插件的群组
+enable = true
+allowed_groups = ["group_id1@chatroom", "group_id2@chatroom"]
 ```
 
-## 🚀 使用指南
-- 在群聊中发送包含抖音链接的消息，插件会自动解析并发送视频卡片。
+## 使用
 
-## 🔍 常见问题
-1. **解析失败**
-   - 请检查网络连接，确保配置文件正确。
+在白名单群聊中发送抖音分享文本即可，例如：
 
-2. **视频链接无效**
-   - 请确保发送的链接为有效的抖音视频链接。
+```text
+复制打开抖音，看看【作者的图文作品】文案内容 https://v.douyin.com/xxxx/
+```
 
-## 🔄 版本历史
-- v1.0.0: 初始版本发布
+插件会自动解析链接：
 
-感谢使用 DouyinParser 插件！
+- 如果是视频，发送视频卡片。
+- 如果是图文，发送 1 张图片和对应文案。
+
+## 验证
+
+插件内包含图文解析回归测试：
+
+```bash
+python -m pytest plugins/DouyinParser/test_douyin_parser.py -q -o addopts=
+```
+
+如果在独立插件仓库中运行：
+
+```bash
+python -m pytest test_douyin_parser.py -q -o addopts=
+```
