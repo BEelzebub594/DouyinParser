@@ -174,41 +174,41 @@ class DouyinParser(PluginBase):
 
     @classmethod
     def _parse_note_item(cls, item: dict[str, Any]) -> dict[str, Any] | None:
-        image_urls = cls._pick_image_urls(item)
-        if not image_urls:
+        image_url_groups = cls._pick_image_url_groups(item)
+        if not image_url_groups:
             return None
 
         return {
             "kind": "note",
             "title": cls._clean_text(item.get("desc")),
             "author": cls._clean_text((item.get("author") or {}).get("nickname")),
-            "image_urls": image_urls,
+            "image_urls": [group[0] for group in image_url_groups],
+            "image_url_groups": image_url_groups,
         }
 
     @classmethod
-    def _pick_image_urls(cls, item: dict[str, Any]) -> list[str]:
-        image_urls: list[str] = []
-        seen: set[str] = set()
+    def _pick_image_url_groups(cls, item: dict[str, Any]) -> list[list[str]]:
+        image_url_groups: list[list[str]] = []
+        seen_groups: set[tuple[str, ...]] = set()
         for image_info in item.get("images") or item.get("image_infos") or []:
             if not isinstance(image_info, dict):
                 continue
             candidates: list[str] = []
+            seen_urls: set[str] = set()
             for image_url in image_info.get("url_list") or []:
-                if isinstance(image_url, str) and image_url.startswith("http"):
-                    candidates.append(html.unescape(image_url))
+                if not isinstance(image_url, str) or not image_url.startswith("http"):
+                    continue
+                decoded_url = html.unescape(image_url)
+                if decoded_url in seen_urls:
+                    continue
+                candidates.append(decoded_url)
+                seen_urls.add(decoded_url)
 
-            selected = ""
-            for image_url in candidates:
-                if re.search(r"\.(?:jpe?g|png)(?:\?|$)", image_url, re.I):
-                    selected = image_url
-                    break
-            if not selected and candidates:
-                selected = candidates[0]
-
-            if selected and selected not in seen:
-                image_urls.append(selected)
-                seen.add(selected)
-        return image_urls
+            group_key = tuple(candidates)
+            if candidates and group_key not in seen_groups:
+                image_url_groups.append(candidates)
+                seen_groups.add(group_key)
+        return image_url_groups
 
     @classmethod
     def _parse_video_item(cls, item: dict[str, Any]) -> dict[str, Any] | None:
@@ -282,12 +282,14 @@ class DouyinParser(PluginBase):
         return "" if value is None else html.unescape(str(value)).strip()
 
     async def _send_note(self, bot: WechatAPIClient, group_id: str, note_info: dict[str, Any]):
-        image_urls = note_info.get("image_urls") or []
-        if not image_urls:
+        image_url_groups = note_info.get("image_url_groups") or [
+            [image_url] for image_url in note_info.get("image_urls") or []
+        ]
+        if not image_url_groups:
             raise VideoParserError("图文作品未找到图片地址")
 
         async with self._create_session() as session:
-            image_bytes = await self._download_long_image(session, image_urls)
+            image_bytes = await self._download_long_image(session, image_url_groups)
 
         await bot.send_image_message(group_id, image=image_bytes)
 
@@ -306,16 +308,36 @@ class DouyinParser(PluginBase):
 
         return self._normalize_image_bytes(image_bytes)
 
-    async def _download_long_image(self, session: aiohttp.ClientSession, image_urls: list[str]) -> bytes:
+    async def _download_long_image(
+        self,
+        session: aiohttp.ClientSession,
+        image_url_groups: list[list[str]],
+    ) -> bytes:
         images: list[Image.Image] = []
-        for image_url in image_urls:
-            image_bytes = await self._download_image(session, image_url)
+        for index, image_url_group in enumerate(image_url_groups, 1):
+            image_bytes = await self._download_image_from_candidates(session, image_url_group, index)
             images.append(self._open_rgb_image(image_bytes))
 
         if not images:
             raise VideoParserError("图文作品未下载到可用图片")
 
         return self._stitch_images_vertically(images)
+
+    async def _download_image_from_candidates(
+        self,
+        session: aiohttp.ClientSession,
+        image_urls: list[str],
+        index: int,
+    ) -> bytes:
+        last_error: Exception | None = None
+        for image_url in image_urls:
+            try:
+                return await self._download_image(session, image_url)
+            except VideoParserError as e:
+                last_error = e
+                logger.warning(f"第 {index} 张图下载失败，尝试备用地址: {e}")
+
+        raise VideoParserError(f"第 {index} 张图所有备用地址均下载失败: {last_error}")
 
     @staticmethod
     def _open_rgb_image(image_bytes: bytes) -> Image.Image:

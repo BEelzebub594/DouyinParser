@@ -107,8 +107,18 @@ def test_parse_note_page_from_router_data():
     assert result["title"] == "ChatGPT Image2.0 提示词。这是一张老式数码相机拍摄的快照"
     assert result["author"] == "河马实验室"
     assert result["image_urls"] == [
-        "https://p3-sign.douyinpic.com/example.jpeg",
-        "https://p26-sign.douyinpic.com/second.png",
+        "https://p26-sign.douyinpic.com/example.webp",
+        "https://p11-sign.douyinpic.com/second.webp",
+    ]
+    assert result["image_url_groups"] == [
+        [
+            "https://p26-sign.douyinpic.com/example.webp",
+            "https://p3-sign.douyinpic.com/example.jpeg",
+        ],
+        [
+            "https://p11-sign.douyinpic.com/second.webp",
+            "https://p26-sign.douyinpic.com/second.png",
+        ],
     ]
     assert "playwm" not in result.get("url", "")
 
