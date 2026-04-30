@@ -174,31 +174,41 @@ class DouyinParser(PluginBase):
 
     @classmethod
     def _parse_note_item(cls, item: dict[str, Any]) -> dict[str, Any] | None:
-        image_url = cls._pick_image_url(item)
-        if not image_url:
+        image_urls = cls._pick_image_urls(item)
+        if not image_urls:
             return None
 
         return {
             "kind": "note",
             "title": cls._clean_text(item.get("desc")),
             "author": cls._clean_text((item.get("author") or {}).get("nickname")),
-            "image_url": image_url,
+            "image_urls": image_urls,
         }
 
     @classmethod
-    def _pick_image_url(cls, item: dict[str, Any]) -> str:
-        candidates: list[str] = []
+    def _pick_image_urls(cls, item: dict[str, Any]) -> list[str]:
+        image_urls: list[str] = []
+        seen: set[str] = set()
         for image_info in item.get("images") or item.get("image_infos") or []:
             if not isinstance(image_info, dict):
                 continue
+            candidates: list[str] = []
             for image_url in image_info.get("url_list") or []:
                 if isinstance(image_url, str) and image_url.startswith("http"):
                     candidates.append(html.unescape(image_url))
 
-        for image_url in candidates:
-            if re.search(r"\.(?:jpe?g|png)(?:\?|$)", image_url, re.I):
-                return image_url
-        return candidates[0] if candidates else ""
+            selected = ""
+            for image_url in candidates:
+                if re.search(r"\.(?:jpe?g|png)(?:\?|$)", image_url, re.I):
+                    selected = image_url
+                    break
+            if not selected and candidates:
+                selected = candidates[0]
+
+            if selected and selected not in seen:
+                image_urls.append(selected)
+                seen.add(selected)
+        return image_urls
 
     @classmethod
     def _parse_video_item(cls, item: dict[str, Any]) -> dict[str, Any] | None:
@@ -272,12 +282,12 @@ class DouyinParser(PluginBase):
         return "" if value is None else html.unescape(str(value)).strip()
 
     async def _send_note(self, bot: WechatAPIClient, group_id: str, note_info: dict[str, Any]):
-        image_url = note_info.get("image_url", "")
-        if not image_url:
+        image_urls = note_info.get("image_urls") or []
+        if not image_urls:
             raise VideoParserError("图文作品未找到图片地址")
 
         async with self._create_session() as session:
-            image_bytes = await self._download_image(session, image_url)
+            image_bytes = await self._download_long_image(session, image_urls)
 
         await bot.send_image_message(group_id, image=image_bytes)
 
@@ -295,6 +305,50 @@ class DouyinParser(PluginBase):
             raise VideoParserError("图文图片内容为空")
 
         return self._normalize_image_bytes(image_bytes)
+
+    async def _download_long_image(self, session: aiohttp.ClientSession, image_urls: list[str]) -> bytes:
+        images: list[Image.Image] = []
+        for image_url in image_urls:
+            image_bytes = await self._download_image(session, image_url)
+            images.append(self._open_rgb_image(image_bytes))
+
+        if not images:
+            raise VideoParserError("图文作品未下载到可用图片")
+
+        return self._stitch_images_vertically(images)
+
+    @staticmethod
+    def _open_rgb_image(image_bytes: bytes) -> Image.Image:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        return image
+
+    @staticmethod
+    def _stitch_images_vertically(images: list[Image.Image]) -> bytes:
+        if not images:
+            raise VideoParserError("没有可拼接的图片")
+
+        target_width = max(image.width for image in images)
+        resized_images: list[Image.Image] = []
+        for image in images:
+            if image.width != target_width:
+                height = max(1, round(image.height * target_width / image.width))
+                image = image.resize((target_width, height), Image.Resampling.LANCZOS)
+            resized_images.append(image)
+
+        total_height = sum(image.height for image in resized_images)
+        long_image = Image.new("RGB", (target_width, total_height), "white")
+
+        offset_y = 0
+        for image in resized_images:
+            long_image.paste(image, (0, offset_y))
+            offset_y += image.height
+
+        output = io.BytesIO()
+        long_image.save(output, format="JPEG", quality=92)
+        return output.getvalue()
 
     @staticmethod
     def _normalize_image_bytes(image_bytes: bytes) -> bytes:
@@ -317,14 +371,11 @@ class DouyinParser(PluginBase):
         lines = []
         author = note_info.get("author", "")
         title = note_info.get("title", "")
-        source_url = note_info.get("source_url", "")
 
         if author:
             lines.append(f"作者：{author}")
         if title:
             lines.append(f"文案：{title}")
-        if source_url:
-            lines.append(f"链接：{source_url}")
         return "\n".join(lines)
 
     async def _send_video_card(self, bot: WechatAPIClient, group_id: str, video_info: dict):

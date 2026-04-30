@@ -1,6 +1,9 @@
 import sys
 import types
+import io
 from pathlib import Path
+
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +73,12 @@ def test_parse_note_page_from_router_data():
                             "https://p26-sign.douyinpic.com/example.webp",
                             "https://p3-sign.douyinpic.com/example.jpeg"
                           ]
+                        },
+                        {
+                          "url_list": [
+                            "https://p11-sign.douyinpic.com/second.webp",
+                            "https://p26-sign.douyinpic.com/second.png"
+                          ]
                         }
                       ],
                       "video": {
@@ -97,5 +106,33 @@ def test_parse_note_page_from_router_data():
     assert result["kind"] == "note"
     assert result["title"] == "ChatGPT Image2.0 提示词。这是一张老式数码相机拍摄的快照"
     assert result["author"] == "河马实验室"
-    assert result["image_url"] == "https://p3-sign.douyinpic.com/example.jpeg"
+    assert result["image_urls"] == [
+        "https://p3-sign.douyinpic.com/example.jpeg",
+        "https://p26-sign.douyinpic.com/second.png",
+    ]
     assert "playwm" not in result.get("url", "")
+
+
+def test_build_note_caption_does_not_include_source_url():
+    caption = DouyinParser._build_note_caption(
+        {
+            "author": "河马实验室",
+            "title": "图文文案",
+            "source_url": "https://www.iesdouyin.com/share/note/123",
+        }
+    )
+
+    assert caption == "作者：河马实验室\n文案：图文文案"
+    assert "链接：" not in caption
+
+
+def test_stitch_images_vertically_keeps_order_and_resizes_to_max_width():
+    first = Image.new("RGB", (10, 20), "red")
+    second = Image.new("RGB", (20, 10), "blue")
+
+    stitched_bytes = DouyinParser._stitch_images_vertically([first, second])
+
+    with Image.open(io.BytesIO(stitched_bytes)) as stitched:
+        assert stitched.size == (20, 50)
+        assert stitched.getpixel((5, 5)) == (254, 0, 0)
+        assert stitched.getpixel((5, 45)) == (0, 0, 254)
