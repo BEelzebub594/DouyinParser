@@ -32,16 +32,18 @@ allowed_groups = ["group_id1@chatroom", "group_id2@chatroom"]
 - 如果是视频，发送视频卡片。
 - 如果是图文，发送 1 张按原图顺序拼接的长图和对应文案。
 
+如果想引用卡片并下载视频，请启用独立的 `DouyinDownloader` 插件。
+
 ## 验证
 
 插件内包含图文解析回归测试：
 
 ```bash
-python -m pytest plugins/DouyinParser/test_douyin_parser.py -q -o addopts=
+python3 -m pytest plugins/DouyinParser/test_douyin_parser.py -q -o addopts=
 ```
 
 如果在独立插件仓库中运行：
 
 ```bash
-python -m pytest test_douyin_parser.py -q -o addopts=
+python3 -m pytest test_douyin_parser.py -q -o addopts=
 ```

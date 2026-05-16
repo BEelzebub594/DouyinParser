@@ -3,6 +3,7 @@ import types
 import io
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 
@@ -27,7 +28,14 @@ if "utils.decorators" not in sys.modules:
 
         return decorator
 
+    def on_quote_message(*args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
     decorators.on_text_message = on_text_message
+    decorators.on_quote_message = on_quote_message
     sys.modules["utils.decorators"] = decorators
 
 if "utils.plugin_base" not in sys.modules:

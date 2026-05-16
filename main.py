@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import io
 import json
@@ -36,6 +37,12 @@ class DouyinParser(PluginBase):
     )
     DOUYIN_URL_RE = re.compile(r'https?://[^\s<>"]+?(?:douyin\.com|iesdouyin\.com)[^\s<>"]*')
     ROUTER_DATA_RE = re.compile(r"window\._ROUTER_DATA\s*=\s*({.*?})\s*</script>", re.S)
+    DEFAULT_THUMB_URL = (
+        "https://is1-ssl.mzstatic.com/image/thumb/Purple221/v4/7c/49/e1/"
+        "7c49e1af-ce92-d1c4-9a93-0a316e47ba94/"
+        "AppIcon_TikTok-0-0-1x_U007epad-0-1-0-0-85-220.png/512x512bb.jpg"
+    )
+    CARD_THUMB_SIZE = (440, 330)
 
     def __init__(self):
         super().__init__()
@@ -222,9 +229,7 @@ class DouyinParser(PluginBase):
         if not video_url:
             return None
 
-        cover = video.get("cover") or {}
-        cover_urls = cover.get("url_list") or []
-        cover_url = cover_urls[0] if cover_urls else ""
+        cover_url = cls._pick_video_cover_url(video)
 
         return {
             "kind": "video",
@@ -233,6 +238,56 @@ class DouyinParser(PluginBase):
             "author": cls._clean_text((item.get("author") or {}).get("nickname")),
             "cover": html.unescape(cover_url),
         }
+
+    @classmethod
+    def _pick_video_cover_url(cls, video: dict[str, Any]) -> str:
+        fallback_url = ""
+        for key in ("cover", "origin_cover", "dynamic_cover", "animated_cover", "ai_dynamic_cover"):
+            cover = video.get(key)
+            if not isinstance(cover, dict):
+                continue
+            cover_url, first_url = cls._pick_preferred_cover_url(cover.get("url_list") or [])
+            if cover_url:
+                return cover_url
+            fallback_url = fallback_url or first_url
+            cover_url, first_url = cls._pick_preferred_cover_url([cover.get("uri"), cover.get("url")])
+            if cover_url:
+                return cover_url
+            fallback_url = fallback_url or first_url
+        return fallback_url
+
+    @classmethod
+    def _pick_first_http_url(cls, urls: list[Any]) -> str:
+        for url in urls:
+            if not isinstance(url, str) or not url:
+                continue
+            decoded_url = cls._decode_url(url)
+            if decoded_url.startswith("http"):
+                return decoded_url
+        return ""
+
+    @classmethod
+    def _pick_preferred_cover_url(cls, urls: list[Any]) -> tuple[str, str]:
+        first_url = cls._pick_first_http_url(urls)
+        for url in urls:
+            if not isinstance(url, str) or not url:
+                continue
+            decoded_url = cls._decode_url(url)
+            if decoded_url.startswith("http") and cls._is_plain_image_url(decoded_url):
+                return decoded_url, first_url
+        return "", first_url
+
+    @staticmethod
+    def _is_plain_image_url(url: str) -> bool:
+        clean_url = str(url or "").split("?", 1)[0].lower()
+        return clean_url.endswith((".jpg", ".jpeg", ".png")) or "format=jpeg" in url.lower()
+
+    @classmethod
+    def _normalize_card_thumb_url(cls, thumb_url: str) -> str:
+        thumb_url = str(thumb_url or "").strip()
+        if not thumb_url or not cls._is_plain_image_url(thumb_url):
+            return cls.DEFAULT_THUMB_URL
+        return thumb_url
 
     @classmethod
     def _parse_legacy_video(cls, html_content: str) -> dict[str, Any] | None:
@@ -388,6 +443,21 @@ class DouyinParser(PluginBase):
             logger.warning(f"图文图片格式检查失败，直接发送原始字节: {e}")
             return image_bytes
 
+    @classmethod
+    def _normalize_card_thumb_bytes(cls, image_bytes: bytes) -> tuple[bytes, int, int]:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.load()
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+
+            resampling = getattr(Image, "Resampling", Image)
+            method = getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", 1))
+            image.thumbnail(cls.CARD_THUMB_SIZE, method)
+
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=86, optimize=True)
+            return output.getvalue(), image.width, image.height
+
     @staticmethod
     def _build_note_caption(note_info: dict[str, Any]) -> str:
         lines = []
@@ -409,23 +479,209 @@ class DouyinParser(PluginBase):
                 display_title = "抖音视频"
 
             video_url = video_info.get("url", "")
-            thumb_url = video_info.get(
-                "cover",
-                "https://is1-ssl.mzstatic.com/image/thumb/Purple221/v4/7c/49/e1/"
-                "7c49e1af-ce92-d1c4-9a93-0a316e47ba94/"
-                "AppIcon_TikTok-0-0-1x_U007epad-0-1-0-0-85-220.png/512x512bb.jpg",
-            )
+            raw_thumb_url = str(video_info.get("cover") or "").strip()
+            thumb_url = self._normalize_card_thumb_url(raw_thumb_url)
+            cdn_thumb = await self._upload_card_thumb(bot, raw_thumb_url)
             description = "点击观看无水印视频"
 
-            logger.info(f"准备发送抖音视频卡片: to={group_id}, title={display_title}, url={video_url}")
-            await bot.send_link_message(
-                wxid=group_id,
-                url=video_url,
-                title=display_title,
-                description=description,
-                thumb_url=thumb_url,
+            logger.info(
+                "准备发送抖音视频卡片: to={}, title={}, url={}, raw_thumb={}, card_thumb={}, cdn_thumb={}",
+                group_id,
+                display_title,
+                video_url,
+                raw_thumb_url,
+                thumb_url,
+                bool(cdn_thumb),
             )
+            if hasattr(bot, "send_app_message"):
+                xml = self._build_video_card_xml(
+                    title=display_title,
+                    description=description,
+                    url=video_url,
+                    thumb_url=thumb_url,
+                    cdn_thumb=cdn_thumb,
+                )
+                await bot.send_app_message(group_id, xml, 49)
+            else:
+                await bot.send_link_message(
+                    wxid=group_id,
+                    url=video_url,
+                    title=display_title,
+                    description=description,
+                    thumb_url=thumb_url,
+                )
         except Exception as e:
             logger.exception(f"发送抖音视频卡片失败: {e}")
             message = f"视频标题：{video_info.get('title', '未知')}\n视频链接：{video_info.get('url', '')}\n"
             await bot.send_text_message(group_id, message)
+
+    async def _upload_card_thumb(self, bot: WechatAPIClient, thumb_url: str) -> dict[str, Any]:
+        if not thumb_url or not hasattr(bot, "call_path"):
+            return {}
+
+        try:
+            async with self._create_session() as session:
+                image_bytes = await self._download_image(session, thumb_url)
+            thumb_bytes, width, height = self._normalize_card_thumb_bytes(image_bytes)
+            payload = {"imageContent": base64.b64encode(thumb_bytes).decode("ascii")}
+            response = await bot.call_path("/message/UploadImageToCDN", body=payload)
+            cdn_info = self._extract_cdn_thumb_info(response)
+            if not cdn_info:
+                logger.warning("抖音封面上传 CDN 未返回可用字段: {}", response)
+                return {}
+
+            cdn_info.setdefault("cdnthumblength", len(thumb_bytes))
+            cdn_info.setdefault("cdnthumbwidth", width)
+            cdn_info.setdefault("cdnthumbheight", height)
+            logger.info(
+                "抖音封面已上传 CDN: url={}, width={}, height={}, length={}",
+                cdn_info.get("cdnthumburl", ""),
+                cdn_info.get("cdnthumbwidth", 0),
+                cdn_info.get("cdnthumbheight", 0),
+                cdn_info.get("cdnthumblength", 0),
+            )
+            return cdn_info
+        except Exception as exc:
+            logger.warning("上传抖音卡片封面 CDN 失败，将使用远程 thumburl: {}", exc)
+            return {}
+
+    @classmethod
+    def _extract_cdn_thumb_info(cls, response: Any) -> dict[str, Any]:
+        candidates = cls._collect_dicts(response)
+
+        info: dict[str, Any] = {}
+        field_map = {
+            "cdnthumburl": (
+                "cdnthumburl",
+                "cdnThumbUrl",
+                "CdnThumbUrl",
+                "cdnThumbURL",
+                "CdnThumbURL",
+                "cdnThumbImgUrl",
+                "CdnThumbImgUrl",
+                "cdnThumbImgURL",
+                "CdnThumbImgURL",
+                "cdnMidImgUrl",
+                "CdnMidImgUrl",
+                "cdnBigImgUrl",
+                "CdnBigImgUrl",
+                "fileId",
+                "FileId",
+                "fileID",
+                "FileID",
+            ),
+            "cdnthumbaeskey": ("cdnthumbaeskey", "cdnThumbAesKey", "CdnThumbAesKey", "aeskey", "aesKey", "AesKey"),
+            "cdnthumbmd5": ("cdnthumbmd5", "cdnThumbMd5", "CdnThumbMd5", "imageMD5", "imageMd5", "md5", "Md5", "MD5"),
+            "cdnthumblength": ("cdnthumblength", "cdnThumbLength", "CdnThumbLength", "recvLen", "length", "Length", "size", "Size"),
+            "cdnthumbwidth": ("cdnthumbwidth", "cdnThumbWidth", "CdnThumbWidth", "width", "Width"),
+            "cdnthumbheight": ("cdnthumbheight", "cdnThumbHeight", "CdnThumbHeight", "height", "Height"),
+        }
+        for normalized_key, aliases in field_map.items():
+            for candidate in candidates:
+                for alias in aliases:
+                    value = candidate.get(alias)
+                    if value not in (None, ""):
+                        info[normalized_key] = value
+                        break
+                if normalized_key in info:
+                    break
+
+        return info if info.get("cdnthumburl") and info.get("cdnthumbaeskey") else {}
+
+    @classmethod
+    def _collect_dicts(cls, value: Any) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            collected.append(value)
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    collected.extend(cls._collect_dicts(nested))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, (dict, list)):
+                    collected.extend(cls._collect_dicts(item))
+        return collected
+
+    @classmethod
+    def _build_video_card_xml(
+        cls,
+        title: str,
+        description: str,
+        url: str,
+        thumb_url: str,
+        cdn_thumb: dict[str, Any] | None = None,
+    ) -> str:
+        safe_title = cls._xml_escape(title or "抖音视频")
+        safe_desc = cls._xml_escape(description or "点击观看无水印视频")
+        safe_url = cls._xml_escape(url or "")
+        safe_thumb = cls._xml_escape(thumb_url or cls.DEFAULT_THUMB_URL)
+        cdn_thumb = cdn_thumb or {}
+        safe_cdn_thumb_url = cls._xml_escape(cdn_thumb.get("cdnthumburl", ""))
+        safe_cdn_thumb_aeskey = cls._xml_escape(cdn_thumb.get("cdnthumbaeskey", ""))
+        safe_cdn_thumb_md5 = cls._xml_escape(cdn_thumb.get("cdnthumbmd5", ""))
+        safe_cdn_thumb_length = cls._xml_escape(cdn_thumb.get("cdnthumblength", 0))
+        safe_cdn_thumb_width = cls._xml_escape(cdn_thumb.get("cdnthumbwidth", 0))
+        safe_cdn_thumb_height = cls._xml_escape(cdn_thumb.get("cdnthumbheight", 0))
+        return (
+            '<appmsg appid="" sdkver="0">'
+            f"<title>{safe_title}</title>"
+            f"<des>{safe_desc}</des>"
+            "<action>view</action>"
+            "<type>5</type>"
+            "<showtype>0</showtype>"
+            "<content></content>"
+            f"<url>{safe_url}</url>"
+            f"<lowurl>{safe_url}</lowurl>"
+            "<forwardflag>0</forwardflag>"
+            "<dataurl></dataurl>"
+            "<lowdataurl></lowdataurl>"
+            "<contentattr>0</contentattr>"
+            "<streamvideo>"
+            "<streamvideourl></streamvideourl>"
+            "<streamvideototaltime>0</streamvideototaltime>"
+            "<streamvideotitle></streamvideotitle>"
+            "<streamvideowording></streamvideowording>"
+            "<streamvideoweburl></streamvideoweburl>"
+            f"<streamvideothumburl>{safe_thumb}</streamvideothumburl>"
+            "<streamvideoaduxinfo></streamvideoaduxinfo>"
+            "<streamvideopublishid></streamvideopublishid>"
+            "</streamvideo>"
+            "<canvasPageItem><canvasPageXml><![CDATA[]]></canvasPageXml></canvasPageItem>"
+            "<appattach>"
+            "<totallen>0</totallen>"
+            "<attachid></attachid>"
+            "<cdnattachurl></cdnattachurl>"
+            "<emoticonmd5></emoticonmd5>"
+            f"<aeskey>{safe_cdn_thumb_aeskey}</aeskey>"
+            "<fileext>jpg</fileext>"
+            f"<cdnthumburl>{safe_cdn_thumb_url}</cdnthumburl>"
+            f"<cdnthumbmd5>{safe_cdn_thumb_md5}</cdnthumbmd5>"
+            f"<cdnthumbaeskey>{safe_cdn_thumb_aeskey}</cdnthumbaeskey>"
+            "<encryver>0</encryver>"
+            f"<cdnthumblength>{safe_cdn_thumb_length}</cdnthumblength>"
+            f"<cdnthumbwidth>{safe_cdn_thumb_width}</cdnthumbwidth>"
+            f"<cdnthumbheight>{safe_cdn_thumb_height}</cdnthumbheight>"
+            "<islargefilemsg>0</islargefilemsg>"
+            "</appattach>"
+            "<extinfo></extinfo>"
+            "<androidsource>2</androidsource>"
+            f"<thumburl>{safe_thumb}</thumburl>"
+            "<mediatagname></mediatagname>"
+            "<messageaction><![CDATA[]]></messageaction>"
+            "<messageext><![CDATA[]]></messageext>"
+            "<emoticongift><packageflag>0</packageflag><packageid></packageid></emoticongift>"
+            "<emoticonshared><packageflag>0</packageflag><packageid></packageid></emoticonshared>"
+            "<webviewshared>"
+            f"<shareUrlOriginal>{safe_url}</shareUrlOriginal>"
+            f"<shareUrlOpen>{safe_url}</shareUrlOpen>"
+            "<jsAppId></jsAppId><publisherId></publisherId><publisherReqId></publisherReqId>"
+            "</webviewshared>"
+            "<finderLiveProductShare><isPriceBeginShow>false</isPriceBeginShow></finderLiveProductShare>"
+            "<gameshare><appbrandext><priority>-1</priority></appbrandext><duration>-1</duration></gameshare>"
+            "<directshare>0</directshare>"
+            "</appmsg>"
+        )
+
+    @staticmethod
+    def _xml_escape(value: Any) -> str:
+        return html.escape(str(value or ""), quote=False)
