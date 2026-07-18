@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import html
 import io
@@ -7,11 +8,13 @@ import json
 import re
 import ssl
 import tomllib
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any
 
 import aiohttp
 from loguru import logger
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from utils.decorators import on_text_message
 from utils.plugin_base import PluginBase
@@ -29,14 +32,20 @@ class VideoParserError(Exception):
 class DouyinParser(PluginBase):
     description = "抖音解析插件"
     author = "BEelzebub"
-    version = "1.1.0"
+    version = "1.3.0"
 
     USER_AGENT = (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1"
     )
-    DOUYIN_URL_RE = re.compile(r'https?://[^\s<>"]+?(?:douyin\.com|iesdouyin\.com)[^\s<>"]*')
+    DESKTOP_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    DOUYIN_URL_RE = re.compile(r'https?://[^\s<>"]+?(?:v\.)?(?:douyin\.com|iesdouyin\.com)[^\s<>"]*')
     ROUTER_DATA_RE = re.compile(r"window\._ROUTER_DATA\s*=\s*({.*?})\s*</script>", re.S)
+    SHARE_SLIDES_RE = re.compile(r"/share/slides/(\d+)")
+    LIVE_HOSTS = {"live.douyin.com", "webcast.amemv.com", "webcast.douyin.com"}
     DEFAULT_THUMB_URL = (
         "https://is1-ssl.mzstatic.com/image/thumb/Purple221/v4/7c/49/e1/"
         "7c49e1af-ce92-d1c4-9a93-0a316e47ba94/"
@@ -54,7 +63,16 @@ class DouyinParser(PluginBase):
 
         config = config["DouyinParser"]
         self.enable = config["enable"]
-        self.allowed_groups = config["allowed_groups"]
+        self.allowed_groups = self._normalize_groups(config.get("allowed_groups", ["*"]))
+        self.blacklist_groups = self._normalize_groups(config.get("blacklist_groups", []))
+
+    @staticmethod
+    def _normalize_groups(value: Any) -> set[str]:
+        if isinstance(value, str):
+            return {value.strip()} if value.strip() else set()
+        if isinstance(value, list):
+            return {str(item).strip() for item in value if str(item).strip()}
+        return set()
 
     @on_text_message(priority=10)
     async def handle_text(self, bot: WechatAPIClient, message: dict):
@@ -66,6 +84,10 @@ class DouyinParser(PluginBase):
         if not content or not group_id:
             return
 
+        if "*" in self.blacklist_groups or group_id in self.blacklist_groups:
+            logger.info(f"抖音解析已被黑名单禁用: {group_id}")
+            return
+
         if "*" not in self.allowed_groups and group_id not in self.allowed_groups:
             return
 
@@ -75,6 +97,16 @@ class DouyinParser(PluginBase):
 
         try:
             result = await self.parse_video(douyin_url)
+            if result.get("kind") == "live":
+                logger.debug(
+                    "抖音直播解析完成: image_source={}, source={}, cover={}, image_size={}",
+                    result.get("image_source", "unknown"),
+                    urlparse(str(result.get("source_url") or "")).path,
+                    result.get("cover", ""),
+                    len(result.get("image_bytes") or b""),
+                )
+                await self._send_live_cover(bot, group_id, result)
+                return
             logger.debug(f"抖音解析结果: {result}")
             if result.get("kind") == "note":
                 await self._send_note(bot, group_id, result)
@@ -94,13 +126,57 @@ class DouyinParser(PluginBase):
             return None
         return match.group(0).rstrip("，。,.!！?？)")
 
+    @classmethod
+    def _is_live_url(cls, url: str) -> bool:
+        parsed_url = urlparse(str(url or ""))
+        hostname = (parsed_url.hostname or "").lower()
+        if hostname in cls.LIVE_HOSTS:
+            return True
+        return hostname.endswith(".amemv.com") and "/webcast/" in parsed_url.path.lower()
+
     async def parse_video(self, video_url: str) -> dict[str, Any]:
         """解析抖音分享页，兼容视频和图文作品。"""
         try:
             async with self._create_session() as session:
                 resolved_url = await self._resolve_redirect(session, video_url)
+                if self._is_live_url(resolved_url):
+                    html_content = await self._fetch_text(session, resolved_url)
+                    cover_urls = self._parse_live_cover_urls(html_content)
+                    stream_url = self._parse_live_stream_url(html_content)
+                    image_source = "live_frame"
+                    try:
+                        if not stream_url:
+                            raise VideoParserError("未找到抖音直播流地址")
+                        image_bytes = await self._capture_live_frame(stream_url, resolved_url)
+                        cover_url = ""
+                    except VideoParserError as exc:
+                        logger.warning("抖音实时画面截取失败，回退官方封面: {}", exc)
+                        if not cover_urls:
+                            raise VideoParserError(f"未找到可用直播画面或官方封面: {exc}") from exc
+                        image_bytes, cover_url = await self._download_live_cover(
+                            session,
+                            cover_urls,
+                            referer=resolved_url,
+                        )
+                        image_source = "official_cover"
+                    return {
+                        "kind": "live",
+                        "cover": cover_url,
+                        "cover_urls": cover_urls,
+                        "stream_url": stream_url,
+                        "image_source": image_source,
+                        "author": self._parse_live_text(html_content, "bottom-username").lstrip("@").strip(),
+                        "title": self._parse_live_text(html_content, "bottom-title"),
+                        "image_bytes": image_bytes,
+                        "source_url": resolved_url,
+                    }
                 html_content = await self._fetch_text(session, resolved_url)
-                result = self._parse_page_html(html_content)
+                try:
+                    result = self._parse_page_html(html_content)
+                except VideoParserError as parse_error:
+                    result = await self._parse_share_api_fallback(session, resolved_url)
+                    if not result:
+                        raise parse_error
                 if "source_url" not in result:
                     result["source_url"] = resolved_url
                 return result
@@ -134,6 +210,43 @@ class DouyinParser(PluginBase):
                 raise VideoParserError("页面内容为空")
             return html_content
 
+    async def _fetch_json(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        *,
+        referer: str = "",
+    ) -> dict[str, Any]:
+        headers = {"Referer": referer} if referer else None
+        async with session.get(url, headers=headers) as response:
+            if response.status != 200:
+                raise VideoParserError(f"获取接口失败，状态码: {response.status}")
+            try:
+                payload = await response.json(content_type=None)
+            except Exception as e:
+                raise VideoParserError(f"接口返回不是 JSON: {e}") from e
+            if not isinstance(payload, dict):
+                raise VideoParserError("接口返回格式异常")
+            return payload
+
+    async def _parse_share_api_fallback(
+        self,
+        session: aiohttp.ClientSession,
+        resolved_url: str,
+    ) -> dict[str, Any] | None:
+        parsed_url = urlparse(resolved_url)
+        slides_match = self.SHARE_SLIDES_RE.search(parsed_url.path)
+        if not slides_match:
+            return None
+
+        item_id = slides_match.group(1)
+        api_url = (
+            f"{parsed_url.scheme}://{parsed_url.netloc}/web/api/v2/aweme/slidesinfo/"
+            f"?aweme_ids=%5B{item_id}%5D&request_source=200"
+        )
+        payload = await self._fetch_json(session, api_url, referer=resolved_url)
+        return self._parse_slides_info(payload)
+
     @classmethod
     def _parse_page_html(cls, html_content: str) -> dict[str, Any]:
         item = cls._extract_aweme_item(html_content)
@@ -151,6 +264,108 @@ class DouyinParser(PluginBase):
             return legacy_video
 
         raise VideoParserError("未找到可解析的抖音图文或视频内容")
+
+    @classmethod
+    def _parse_live_cover_url(cls, html_content: str) -> str:
+        cover_urls = cls._parse_live_cover_urls(html_content)
+        return cover_urls[0] if cover_urls else ""
+
+    @classmethod
+    def _parse_live_cover_urls(cls, html_content: str) -> list[str]:
+        cover_urls: list[str] = []
+        seen: set[str] = set()
+
+        def add_url(value: str) -> None:
+            value = str(value or "").strip()
+            if not value:
+                return
+            try:
+                decoded = html.unescape(json.loads(f'"{value}"'))
+            except (json.JSONDecodeError, TypeError):
+                decoded = html.unescape(value.replace(r"\u0026", "&").replace(r"\/", "/"))
+            decoded = decoded.rstrip("\\")
+            if decoded.startswith("http") and decoded not in seen:
+                seen.add(decoded)
+                cover_urls.append(decoded)
+
+        plain_patterns = (
+            r'cover="(https://[^\"]*webcast-cover[^\"]+)"',
+            r'<img[^>]+src="(https://[^\"]*webcast-cover[^\"]+)"',
+        )
+        for pattern in plain_patterns:
+            for match in re.finditer(pattern, html_content, re.I):
+                add_url(match.group(1))
+
+        for block_match in re.finditer(
+            r'\\"cover\\":\{\\"urlList\\":\[(.*?)\]',
+            html_content,
+            re.I | re.S,
+        ):
+            for url_match in re.finditer(
+                r'\\"(https:[^\"]*webcast-cover[^\"]+?)(?=\\")',
+                block_match.group(1),
+                re.I,
+            ):
+                add_url(url_match.group(1))
+
+        return cover_urls
+
+    @classmethod
+    def _parse_live_text(cls, html_content: str, class_prefix: str) -> str:
+        match = re.search(
+            rf'<div[^>]+class="[^"]*{re.escape(class_prefix)}[^"]*"[^>]*>(.*?)</div>',
+            html_content,
+            re.I | re.S,
+        )
+        if not match:
+            return ""
+
+        text = re.sub(r"<!--.*?-->|<[^>]+>", "", match.group(1), flags=re.S)
+        return html.unescape(text).strip()
+
+    @classmethod
+    def _parse_live_stream_url(cls, html_content: str) -> str:
+        plain_match = re.search(
+            r'<webcast-reflow-player[^>]+\burl="([^"]+\.(?:flv|m3u8)[^"]*)"',
+            html_content,
+            re.I,
+        )
+        if plain_match:
+            return html.unescape(plain_match.group(1))
+
+        escaped_match = re.search(
+            r'\\"flvPullUrl\\":\{.*?\\"(?:HD1|SD2|SD1)\\":\\"(https?:[^\"]+?)(?=\\")',
+            html_content,
+            re.I | re.S,
+        )
+        if not escaped_match:
+            return ""
+
+        escaped_url = escaped_match.group(1)
+        try:
+            stream_url = json.loads(f'"{escaped_url}"')
+        except json.JSONDecodeError:
+            stream_url = escaped_url.replace(r"\u0026", "&").replace(r"\/", "/")
+        return html.unescape(stream_url)
+
+    @classmethod
+    def _parse_slides_info(cls, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if payload.get("status_code") != 0:
+            return None
+
+        aweme_details = payload.get("aweme_details")
+        if not isinstance(aweme_details, list) or not aweme_details:
+            return None
+
+        item = aweme_details[0]
+        if not isinstance(item, dict):
+            return None
+
+        note = cls._parse_note_item(item)
+        if note:
+            return note
+
+        return cls._parse_video_item(item)
 
     @classmethod
     def _extract_aweme_item(cls, html_content: str) -> dict[str, Any] | None:
@@ -346,20 +561,275 @@ class DouyinParser(PluginBase):
         async with self._create_session() as session:
             image_bytes = await self._download_long_image(session, image_url_groups)
 
-        await bot.send_image_message(group_id, image=image_bytes)
+        await self._send_image_once(bot, group_id, image_bytes)
 
         caption = self._build_note_caption(note_info)
         if caption:
             await bot.send_text_message(group_id, caption)
 
-    async def _download_image(self, session: aiohttp.ClientSession, image_url: str) -> bytes:
-        async with session.get(image_url) as response:
+    async def _send_live_cover(self, bot: WechatAPIClient, group_id: str, live_info: dict[str, Any]):
+        image_bytes = live_info.get("image_bytes")
+        if not isinstance(image_bytes, bytes) or not image_bytes:
+            cover_url = str(live_info.get("cover") or "").strip()
+            cover_urls = [str(url).strip() for url in live_info.get("cover_urls") or [] if str(url).strip()]
+            if cover_url and cover_url not in cover_urls:
+                cover_urls.insert(0, cover_url)
+            if not cover_urls:
+                raise VideoParserError("抖音直播间封面地址为空")
+            async with self._create_session() as session:
+                image_bytes, _ = await self._download_live_cover(
+                    session,
+                    cover_urls,
+                    referer=str(live_info.get("source_url") or ""),
+                )
+
+        card_bytes = self._compose_live_cover_card(image_bytes, live_info)
+        await self._send_image_once(bot, group_id, card_bytes)
+        logger.info(
+            "抖音直播图片发送完成: to={}, image_source={}, source_path={}",
+            group_id,
+            live_info.get("image_source", "unknown"),
+            urlparse(str(live_info.get("source_url") or "")).path,
+        )
+
+    @staticmethod
+    def _build_live_caption(live_info: dict[str, Any]) -> str:
+        lines = []
+        author = str(live_info.get("author") or "").strip()
+        title = str(live_info.get("title") or "").strip()
+        if author:
+            lines.append(f"主播：{author}")
+        if title:
+            lines.append(f"标题：{title}")
+        return "\n".join(lines)
+
+    @classmethod
+    def _compose_live_cover_card(cls, image_bytes: bytes, live_info: dict[str, Any]) -> bytes:
+        caption = cls._build_live_caption(live_info)
+        if not caption:
+            return image_bytes
+
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            cover = source.convert("RGB")
+
+        width = cover.width
+        padding_x = max(28, width // 24)
+        padding_y = max(24, width // 32)
+        author_size = max(22, min(34, width // 32))
+        title_size = max(28, min(46, width // 25))
+        author_font = cls._load_live_font(author_size)
+        title_font = cls._load_live_font(title_size)
+        measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        max_text_width = width - padding_x * 2
+
+        author = str(live_info.get("author") or "").strip()
+        title = str(live_info.get("title") or "").strip()
+        title_lines = cls._wrap_live_text(measure, title, title_font, max_text_width) if title else []
+        author_height = author_size + 10 if author else 0
+        title_line_height = title_size + 14
+        content_height = author_height + len(title_lines) * title_line_height
+        if author and title_lines:
+            content_height += 8
+        header_height = padding_y * 2 + content_height
+
+        card = Image.new("RGB", (width, header_height + cover.height), (250, 250, 250))
+        draw = ImageDraw.Draw(card)
+        draw.rectangle((0, 0, 8, header_height), fill=(254, 44, 85))
+
+        y = padding_y
+        if author:
+            draw.text((padding_x, y), f"主播  {author}", font=author_font, fill=(95, 95, 102))
+            y += author_height + (8 if title_lines else 0)
+        for line in title_lines:
+            draw.text((padding_x, y), line, font=title_font, fill=(24, 24, 28))
+            y += title_line_height
+
+        card.paste(cover, (0, header_height))
+        output = io.BytesIO()
+        card.save(output, format="JPEG", quality=92)
+        return output.getvalue()
+
+    @staticmethod
+    def _load_live_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        candidates = (
+            Path("plugins/TarotDivination/fonts/Songti.ttc"),
+            Path("/System/Library/Fonts/PingFang.ttc"),
+            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        )
+        for font_path in candidates:
+            if not font_path.exists():
+                continue
+            try:
+                return ImageFont.truetype(str(font_path), size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    @staticmethod
+    def _wrap_live_text(
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: ImageFont.ImageFont,
+        max_width: int,
+    ) -> list[str]:
+        lines: list[str] = []
+        current = ""
+        for char in text:
+            candidate = current + char
+            if current and draw.textlength(candidate, font=font) > max_width:
+                lines.append(current)
+                current = char
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines[:3]
+
+    async def _download_live_cover(
+        self,
+        session: aiohttp.ClientSession,
+        cover_urls: list[str],
+        *,
+        referer: str,
+    ) -> tuple[bytes, str]:
+        request_profiles = (
+            (referer, ""),
+            ("https://live.douyin.com/", self.DESKTOP_USER_AGENT),
+            ("", self.DESKTOP_USER_AGENT),
+        )
+        last_error: Exception | None = None
+        for cover_url in cover_urls:
+            for request_referer, user_agent in request_profiles:
+                try:
+                    image_bytes = await self._download_image(
+                        session,
+                        cover_url,
+                        referer=request_referer,
+                        user_agent=user_agent,
+                    )
+                    return image_bytes, cover_url
+                except VideoParserError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "抖音直播封面下载失败，尝试备用节点/请求头: cdn={}, referer_host={}, error={}",
+                        urlparse(cover_url).hostname or "unknown",
+                        urlparse(request_referer).hostname or "<empty>",
+                        exc,
+                    )
+        raise VideoParserError(f"下载直播间封面失败: {last_error}")
+
+    async def _capture_live_frame(self, stream_url: str, referer: str) -> bytes:
+        command = (
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rw_timeout",
+            "8000000",
+            "-user_agent",
+            self.DESKTOP_USER_AGENT,
+            "-headers",
+            f"Referer: {referer}\r\n",
+            "-i",
+            stream_url,
+            "-an",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise VideoParserError("运行环境未安装 ffmpeg") from exc
+
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=12)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise VideoParserError("截取直播画面超时") from exc
+
+        if process.returncode != 0 or not stdout:
+            error_text = stderr.decode("utf-8", errors="ignore").strip()
+            if len(error_text) > 240:
+                error_text = error_text[:240] + "..."
+            raise VideoParserError(f"ffmpeg 截帧失败: {error_text or process.returncode}")
+
+        return self._normalize_image_bytes(stdout)
+
+    @classmethod
+    async def _send_image_once(cls, bot: WechatAPIClient, group_id: str, image_bytes: bytes):
+        if hasattr(bot, "send_image_message"):
+            result = await bot.send_image_message(group_id, image=image_bytes)
+            if cls._extract_send_success_flag(result) is False:
+                raise VideoParserError("微信图片接口返回发送失败")
+            return
+
+        if hasattr(bot, "call_path"):
+            payload = {
+                "MsgItem": [
+                    {
+                        "ToUserName": group_id,
+                        "MsgType": 2,
+                        "ImageContent": base64.b64encode(image_bytes).decode("ascii"),
+                    }
+                ]
+            }
+            result = await bot.call_path("/message/SendImageMessage", body=payload)
+            if cls._extract_send_success_flag(result) is False:
+                raise VideoParserError("微信图片接口返回发送失败")
+            return
+
+        raise VideoParserError("当前微信客户端不支持发送图片")
+
+    @classmethod
+    def _extract_send_success_flag(cls, response: Any) -> bool | None:
+        found_false = False
+        for candidate in cls._collect_dicts(response):
+            for key in ("isSendSuccess", "IsSendSuccess", "sendSuccess", "SendSuccess"):
+                if key not in candidate:
+                    continue
+                value = candidate[key]
+                if value is True or value == 1 or str(value).lower() == "true":
+                    return True
+                if value is False or value == 0 or str(value).lower() == "false":
+                    found_false = True
+        return False if found_false else None
+
+    async def _download_image(
+        self,
+        session: aiohttp.ClientSession,
+        image_url: str,
+        *,
+        referer: str = "",
+        user_agent: str = "",
+    ) -> bytes:
+        headers = {
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+        if referer:
+            headers["Referer"] = referer
+        if user_agent:
+            headers["User-Agent"] = user_agent
+
+        async with session.get(image_url, headers=headers) as response:
             if response.status != 200:
-                raise VideoParserError(f"下载图文图片失败，状态码: {response.status}")
+                raise VideoParserError(f"下载图片失败，状态码: {response.status}")
             image_bytes = await response.read()
 
         if not image_bytes:
-            raise VideoParserError("图文图片内容为空")
+            raise VideoParserError("图片内容为空")
 
         return self._normalize_image_bytes(image_bytes)
 
