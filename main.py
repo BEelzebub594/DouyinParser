@@ -7,9 +7,10 @@ import io
 import json
 import re
 import ssl
+import time
 import tomllib
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from typing import Any
 
 import aiohttp
@@ -23,6 +24,8 @@ try:
     from WechatAPI import WechatAPIClient
 except ImportError:  # 兼容部分框架版本的导出路径
     from WechatAPI.Client import WechatAPIClient
+
+from plugins.DouyinParser.a_bogus import generate_a_bogus
 
 
 class VideoParserError(Exception):
@@ -45,13 +48,20 @@ class DouyinParser(PluginBase):
     DOUYIN_URL_RE = re.compile(r'https?://[^\s<>"]+?(?:v\.)?(?:douyin\.com|iesdouyin\.com)[^\s<>"]*')
     ROUTER_DATA_RE = re.compile(r"window\._ROUTER_DATA\s*=\s*({.*?})\s*</script>", re.S)
     SHARE_SLIDES_RE = re.compile(r"/share/slides/(\d+)")
+    ITEM_ID_RE = re.compile(r"/(?:video|note|slides|share)/?(\d{10,})")
     LIVE_HOSTS = {"live.douyin.com", "webcast.amemv.com", "webcast.douyin.com"}
+    DETAIL_API_URL = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
+    TTWID_API_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
     DEFAULT_THUMB_URL = (
         "https://is1-ssl.mzstatic.com/image/thumb/Purple221/v4/7c/49/e1/"
         "7c49e1af-ce92-d1c4-9a93-0a316e47ba94/"
         "AppIcon_TikTok-0-0-1x_U007epad-0-1-0-0-85-220.png/512x512bb.jpg"
     )
     CARD_THUMB_SIZE = (440, 330)
+
+    _ttwid_cache: str | None = None
+    _ttwid_cache_time: float = 0.0
+    _ttwid_ttl = 3600.0
 
     def __init__(self):
         super().__init__()
@@ -171,6 +181,15 @@ class DouyinParser(PluginBase):
                         "source_url": resolved_url,
                     }
                 html_content = await self._fetch_text(session, resolved_url)
+                item_id = self._extract_item_id(resolved_url)
+                if item_id:
+                    try:
+                        result = await self._parse_via_detail_api(session, item_id, resolved_url)
+                        if "source_url" not in result:
+                            result["source_url"] = resolved_url
+                        return result
+                    except VideoParserError as detail_error:
+                        logger.warning("抖音详情接口解析失败，回退页面解析: {}", detail_error)
                 try:
                     result = self._parse_page_html(html_content)
                 except VideoParserError as parse_error:
@@ -246,6 +265,112 @@ class DouyinParser(PluginBase):
         )
         payload = await self._fetch_json(session, api_url, referer=resolved_url)
         return self._parse_slides_info(payload)
+
+    @classmethod
+    def _extract_item_id(cls, resolved_url: str) -> str:
+        match = cls.ITEM_ID_RE.search(str(resolved_url or ""))
+        return match.group(1) if match else ""
+
+    @classmethod
+    def _build_detail_query(cls, item_id: str) -> str:
+        params = {
+            "device_platform": "webapp",
+            "aid": "6383",
+            "channel": "channel_pc_web",
+            "aweme_id": item_id,
+            "update_version_code": "170400",
+            "pc_client_type": "1",
+            "version_code": "170400",
+            "version_name": "17.4.0",
+            "cookie_enabled": "true",
+            "screen_width": "1536",
+            "screen_height": "864",
+            "browser_language": "zh-CN",
+            "browser_platform": "Win32",
+            "browser_name": "Chrome",
+            "browser_version": "123.0.0.0",
+            "browser_online": "true",
+            "engine_name": "Blink",
+            "engine_version": "123.0.0.0",
+            "os_name": "Windows",
+            "os_version": "10",
+            "cpu_core_num": "16",
+            "device_memory": "8",
+            "platform": "PC",
+            "downlink": "10",
+            "effective_type": "4g",
+            "round_trip_time": "50",
+        }
+        return "&".join(f"{key}={value}" for key, value in params.items())
+
+    async def _get_ttwid(self, session: aiohttp.ClientSession) -> str:
+        now = time.time()
+        if self._ttwid_cache and now - self._ttwid_cache_time < self._ttwid_ttl:
+            return self._ttwid_cache
+        async with session.post(
+            self.TTWID_API_URL,
+            json={
+                "region": "cn",
+                "aid": 1768,
+                "needFid": False,
+                "service": "www.ixigua.com",
+                "migrate_info": {"ticket": "", "source": "node"},
+                "cbUrlProtocol": "https",
+                "union": True,
+            },
+        ) as response:
+            if response.status != 200:
+                raise VideoParserError(f"获取抖音 ttwid 失败，状态码: {response.status}")
+            set_cookie = response.headers.get("Set-Cookie", "")
+        match = re.search(r"ttwid=([^;]+)", set_cookie)
+        if not match:
+            raise VideoParserError("获取抖音 ttwid 失败: 响应中未包含 ttwid")
+        self._ttwid_cache = match.group(1)
+        self._ttwid_cache_time = now
+        return self._ttwid_cache
+
+    async def _parse_via_detail_api(
+        self,
+        session: aiohttp.ClientSession,
+        item_id: str,
+        resolved_url: str,
+    ) -> dict[str, Any]:
+        ttwid = await self._get_ttwid(session)
+        query = self._build_detail_query(item_id)
+        bogus = generate_a_bogus(query, self.DESKTOP_USER_AGENT)
+        detail_url = (
+            f"{self.DETAIL_API_URL}?{query}&a_bogus={quote(bogus, safe='')}"
+        )
+        headers = {
+            "Cookie": f"ttwid={ttwid}",
+            "Referer": "https://www.douyin.com/",
+            "User-Agent": self.DESKTOP_USER_AGENT,
+        }
+        async with session.get(detail_url, headers=headers) as response:
+            if response.status != 200:
+                raise VideoParserError(f"抖音详情接口失败，状态码: {response.status}")
+            payload = await response.json(content_type=None)
+        if not isinstance(payload, dict) or payload.get("status_code") != 0:
+            raise VideoParserError("抖音详情接口未返回有效数据")
+        aweme = payload.get("aweme_detail")
+        if not isinstance(aweme, dict) or not aweme.get("aweme_id"):
+            raise VideoParserError("抖音详情接口未返回作品数据")
+
+        note = self._parse_note_item(aweme)
+        if note:
+            note["source_url"] = resolved_url
+            return note
+
+        video = self._parse_video_item(aweme)
+        if video:
+            play_addr = (aweme.get("video") or {}).get("play_addr")
+            play_uri = str(play_addr.get("uri") or "") if isinstance(play_addr, dict) else ""
+            if play_uri:
+                video["url"] = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={play_uri}&ratio=720p&line=0"
+            video["source_url"] = resolved_url
+            return video
+
+        raise VideoParserError("未找到可解析的抖音图文或视频内容")
 
     @classmethod
     def _parse_page_html(cls, html_content: str) -> dict[str, Any]:
