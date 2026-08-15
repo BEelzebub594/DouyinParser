@@ -1078,6 +1078,9 @@ class DouyinParser(PluginBase):
             thumb_url = self._normalize_card_thumb_url(raw_thumb_url)
             cdn_thumb = await self._upload_card_thumb(bot, raw_thumb_url)
             description = "点击观看无水印视频"
+            if not cdn_thumb:
+                thumb_url = ""
+                logger.warning("抖音封面不可用，降级发送无封面卡片: to={}, title={}", group_id, display_title)
 
             logger.info(
                 "准备发送抖音视频卡片: to={}, title={}, url={}, raw_thumb={}, card_thumb={}, cdn_thumb={}",
@@ -1137,7 +1140,7 @@ class DouyinParser(PluginBase):
             )
             return cdn_info
         except Exception as exc:
-            logger.warning("上传抖音卡片封面 CDN 失败，将使用远程 thumburl: {}", exc)
+            logger.warning("上传抖音卡片封面 CDN 失败，将降级为无封面卡片: {}", exc)
             return {}
 
     @classmethod
@@ -1209,8 +1212,11 @@ class DouyinParser(PluginBase):
         safe_title = cls._xml_escape(title or "抖音视频")
         safe_desc = cls._xml_escape(description or "点击观看无水印视频")
         safe_url = cls._xml_escape(url or "")
-        safe_thumb = cls._xml_escape(thumb_url or cls.DEFAULT_THUMB_URL)
         cdn_thumb = cdn_thumb or {}
+        if cdn_thumb.get("cdnthumburl"):
+            safe_thumb = cls._xml_escape(thumb_url or "")
+        else:
+            safe_thumb = ""
         safe_cdn_thumb_url = cls._xml_escape(cdn_thumb.get("cdnthumburl", ""))
         safe_cdn_thumb_aeskey = cls._xml_escape(cdn_thumb.get("cdnthumbaeskey", ""))
         safe_cdn_thumb_md5 = cls._xml_escape(cdn_thumb.get("cdnthumbmd5", ""))
