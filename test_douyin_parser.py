@@ -63,6 +63,122 @@ except ModuleNotFoundError:
     from main import DouyinParser, VideoParserError
 
 
+def test_warmup_shell_without_video_payload():
+    html = """
+    <html>
+      <body>
+        <script>
+          window._ROUTER_DATA = {"loaderData": {"video_(id)/page": {}}}
+        </script>
+      </body>
+    </html>
+    """
+
+    assert DouyinParser._is_warmup_shell(html) is True
+
+
+def test_share_page_with_video_info_is_not_warmup():
+    html = """
+    <html>
+      <body>
+        <script>
+          window._ROUTER_DATA = {
+            "loaderData": {
+              "video_(id)/page": {
+                "videoInfoRes": {
+                  "item_list": [
+                    {
+                      "desc": "测试视频",
+                      "author": {"nickname": "作者"},
+                      "video": {
+                        "duration": 1000,
+                        "play_addr": {
+                          "url_list": [
+                            "https://aweme.snssdk.com/aweme/v1/play/?video_id=abc"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        </script>
+      </body>
+    </html>
+    """
+
+    assert DouyinParser._is_warmup_shell(html) is False
+
+
+def test_parse_share_page_refetches_warmup_shell():
+    warmup_html = """
+    <html>
+      <script>window._ROUTER_DATA = {"loaderData": {"video_(id)/page": {}}}</script>
+    </html>
+    """
+    ready_html = """
+    <html>
+      <script>
+        window._ROUTER_DATA = {
+          "loaderData": {
+            "video_(id)/page": {
+              "videoInfoRes": {
+                "item_list": [
+                  {
+                    "desc": "二次请求才有数据",
+                    "author": {"nickname": "柚柚"},
+                    "video": {
+                      "duration": 1000,
+                      "play_addr": {
+                        "url_list": [
+                          "https://aweme.snssdk.com/aweme/v1/play/?video_id=abc"
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      </script>
+    </html>
+    """
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            html = warmup_html if self.calls == 1 else ready_html
+
+            class FakeResponse:
+                status = 200
+
+                async def text(self):
+                    return html
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+            return FakeResponse()
+
+    session = FakeSession()
+    parser = DouyinParser.__new__(DouyinParser)
+    result = asyncio.run(parser._parse_share_page(session, "https://www.iesdouyin.com/share/video/123"))
+
+    assert session.calls == 2
+    assert result["kind"] == "video"
+    assert result["title"] == "二次请求才有数据"
+    assert result["author"] == "柚柚"
+
+
 def test_parse_note_page_from_router_data():
     html = """
     <html>

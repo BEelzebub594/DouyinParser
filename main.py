@@ -191,7 +191,7 @@ class DouyinParser(PluginBase):
                     except VideoParserError as detail_error:
                         logger.warning("抖音详情接口解析失败，回退页面解析: {}", detail_error)
                 try:
-                    result = self._parse_page_html(html_content)
+                    result = await self._parse_share_page(session, resolved_url, html_content)
                 except VideoParserError as parse_error:
                     result = await self._parse_share_api_fallback(session, resolved_url)
                     if not result:
@@ -228,6 +228,22 @@ class DouyinParser(PluginBase):
             if not html_content:
                 raise VideoParserError("页面内容为空")
             return html_content
+
+    async def _parse_share_page(
+        self,
+        session: aiohttp.ClientSession,
+        resolved_url: str,
+        html_content: str | None = None,
+    ) -> dict[str, Any]:
+        if html_content is None:
+            html_content = await self._fetch_text(session, resolved_url)
+        if self._is_warmup_shell(html_content):
+            logger.info(
+                "抖音分享页为预热空壳，携带 Cookie 二次请求: {}",
+                urlparse(resolved_url).path,
+            )
+            html_content = await self._fetch_text(session, resolved_url)
+        return self._parse_page_html(html_content)
 
     async def _fetch_json(
         self,
@@ -371,6 +387,14 @@ class DouyinParser(PluginBase):
             return video
 
         raise VideoParserError("未找到可解析的抖音图文或视频内容")
+
+    @classmethod
+    def _is_warmup_shell(cls, html_content: str) -> bool:
+        if not html_content:
+            return True
+        if cls._extract_aweme_item(html_content):
+            return False
+        return cls._parse_legacy_video(html_content) is None
 
     @classmethod
     def _parse_page_html(cls, html_content: str) -> dict[str, Any]:
