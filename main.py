@@ -10,6 +10,7 @@ import ssl
 import time
 import tomllib
 from pathlib import Path
+import urllib.parse
 from urllib.parse import quote, urlparse
 from typing import Any
 
@@ -26,6 +27,7 @@ except ImportError:  # 兼容部分框架版本的导出路径
     from WechatAPI.Client import WechatAPIClient
 
 from plugins.DouyinParser.a_bogus import generate_a_bogus
+from plugins.DouyinParser.ac_sign import sign_ac
 
 
 class VideoParserError(Exception):
@@ -183,6 +185,13 @@ class DouyinParser(PluginBase):
                 html_content = await self._fetch_text(session, resolved_url)
                 item_id = self._extract_item_id(resolved_url)
                 if item_id:
+                    try:
+                        result = await self._parse_via_render_data(session, item_id, resolved_url)
+                        if "source_url" not in result:
+                            result["source_url"] = resolved_url
+                        return result
+                    except VideoParserError as render_error:
+                        logger.warning("抖音 RENDER_DATA 解析失败，回退详情接口: {}", render_error)
                     try:
                         result = await self._parse_via_detail_api(session, item_id, resolved_url)
                         if "source_url" not in result:
@@ -344,6 +353,113 @@ class DouyinParser(PluginBase):
         self._ttwid_cache = match.group(1)
         self._ttwid_cache_time = now
         return self._ttwid_cache
+
+
+    RENDER_DATA_RE = re.compile(
+        r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', re.S
+    )
+
+    async def _parse_via_render_data(
+        self,
+        session: aiohttp.ClientSession,
+        item_id: str,
+        resolved_url: str,
+    ) -> dict[str, Any]:
+        async with session.get("https://www.douyin.com/", headers={"User-Agent": self.DESKTOP_USER_AGENT}) as response:
+            nonce = ""
+            for header in response.headers.getall("Set-Cookie", []):
+                match = re.search(r"__ac_nonce=([^;]+)", header)
+                if match:
+                    nonce = match.group(1)
+                    break
+        if not nonce:
+            raise VideoParserError("未获取到抖音 __ac_nonce")
+        signature = await asyncio.to_thread(sign_ac, nonce, self.DESKTOP_USER_AGENT)
+        page_url = f"https://www.douyin.com/user/self?modal_id={item_id}&showTab=like"
+        headers = {
+            "User-Agent": self.DESKTOP_USER_AGENT,
+            "Referer": "https://www.douyin.com/",
+            "Cookie": f"__ac_nonce={nonce}; __ac_signature={signature}",
+        }
+        async with session.get(page_url, headers=headers) as response:
+            if response.status != 200:
+                raise VideoParserError(f"抖音作品页失败，状态码: {response.status}")
+            html_content = await response.text()
+        match = self.RENDER_DATA_RE.search(html_content)
+        if not match:
+            raise VideoParserError("抖音作品页未包含 RENDER_DATA")
+        try:
+            data = json.loads(urllib.parse.unquote(match.group(1)))
+            detail = data["app"]["videoDetail"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise VideoParserError(f"抖音作品页数据解析失败: {exc}") from exc
+        if not isinstance(detail, dict):
+            raise VideoParserError("抖音作品页未返回作品数据")
+
+        note = self._parse_render_note(detail)
+        if note:
+            note["source_url"] = resolved_url
+            return note
+        video = self._parse_render_video(detail)
+        if video:
+            video["source_url"] = resolved_url
+            return video
+        raise VideoParserError("未找到可解析的抖音图文或视频内容")
+
+    @classmethod
+    def _parse_render_video(cls, detail: dict[str, Any]) -> dict[str, Any] | None:
+        video = detail.get("video")
+        if not isinstance(video, dict):
+            return None
+        play_addr = video.get("playAddr") or []
+        video_url = ""
+        if isinstance(play_addr, list):
+            for entry in play_addr:
+                src = entry.get("src") if isinstance(entry, dict) else ""
+                if isinstance(src, str) and src.startswith("http"):
+                    video_url = src
+                    break
+        if not video_url:
+            return None
+        cover = video.get("cover") if isinstance(video.get("cover"), str) else ""
+        if not cover:
+            covers = video.get("coverUrlList") or []
+            cover = covers[0] if covers and isinstance(covers[0], str) else ""
+        author = detail.get("authorInfo") or {}
+        return {
+            "kind": "video",
+            "url": html.unescape(video_url),
+            "title": cls._clean_text(detail.get("desc")),
+            "author": cls._clean_text(author.get("nickname")),
+            "cover": html.unescape(cover),
+        }
+
+    @classmethod
+    def _parse_render_note(cls, detail: dict[str, Any]) -> dict[str, Any] | None:
+        images = detail.get("images")
+        if not isinstance(images, list) or not images:
+            return None
+        groups: list[list[str]] = []
+        for image in images:
+            urls: list[str] = []
+            candidates = image.get("urlList") if isinstance(image, dict) else None
+            if not candidates and isinstance(image, dict):
+                candidates = image.get("url_list")
+            for candidate in candidates or []:
+                if isinstance(candidate, str) and candidate.startswith("http"):
+                    urls.append(html.unescape(candidate))
+            if urls:
+                groups.append(urls)
+        if not groups:
+            return None
+        author = detail.get("authorInfo") or {}
+        return {
+            "kind": "note",
+            "title": cls._clean_text(detail.get("desc")),
+            "author": cls._clean_text(author.get("nickname")),
+            "image_urls": [group[0] for group in groups],
+            "image_url_groups": groups,
+        }
 
     async def _parse_via_detail_api(
         self,

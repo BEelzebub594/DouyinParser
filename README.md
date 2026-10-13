@@ -12,6 +12,24 @@
 - 支持 `allowed_groups = ["*"]` 或指定群聊白名单。
 - 支持 `blacklist_groups` 黑名单，黑名单优先级高于白名单。
 
+## 解析链路
+
+主解析走抖音作品页 `RENDER_DATA`，失败时自动回退到 `detail` 详情接口：
+
+1. 请求 `https://www.douyin.com/` 获取 `__ac_nonce`，由 `ac_sign.py` 结合 `acrawler.js` 生成 `__ac_signature`。
+2. 携带 `__ac_nonce` / `__ac_signature` Cookie 请求作品页 `{modal_id}`，从 `RENDER_DATA` 中提取视频或图文数据。
+3. `RENDER_DATA` 解析失败（空壳页、风控等）时回退 `detail` API，并使用 `a_bogus` 签名。
+
+## 依赖
+
+除框架自带依赖外，额外需要：
+
+```bash
+pip install py_mini_racer
+```
+
+`acrawler.js` 为抖音 `__ac_signature` 生成脚本，由 `ac_sign.py` 通过 `py_mini_racer` 调用，请勿删除。
+
 ## 配置
 
 在 `plugins/DouyinParser/config.toml` 中配置：
