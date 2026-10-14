@@ -365,13 +365,24 @@ class DouyinParser(PluginBase):
         item_id: str,
         resolved_url: str,
     ) -> dict[str, Any]:
-        async with session.get("https://www.douyin.com/", headers={"User-Agent": self.DESKTOP_USER_AGENT}) as response:
+        async with session.get("https://www.douyin.com/", headers={"User-Agent": self.DESKTOP_USER_AGENT, "Cookie": ""}, cookies={}, skip_auto_headers={"User-Agent"}) as response:
             nonce = ""
-            for header in response.headers.getall("Set-Cookie", []):
-                match = re.search(r"__ac_nonce=([^;]+)", header)
-                if match:
-                    nonce = match.group(1)
-                    break
+            sent_cookie = response.request_info.headers.get("Cookie", "")
+            match = re.search(r"__ac_nonce=([^;]+)", sent_cookie)
+            if match:
+                nonce = match.group(1)
+            if not nonce:
+                for header in response.headers.getall("Set-Cookie", []):
+                    match = re.search(r"__ac_nonce=([^;]+)", header)
+                    if match:
+                        nonce = match.group(1)
+                        break
+            if not nonce:
+                for header in response.headers.getall("Set-Cookie", []):
+                    match = re.search(r"__ac_nonce=([^;]+)", header)
+                    if match:
+                        nonce = match.group(1)
+                        break
         if not nonce:
             raise VideoParserError("未获取到抖音 __ac_nonce")
         signature = await asyncio.to_thread(sign_ac, nonce, self.DESKTOP_USER_AGENT)
@@ -381,7 +392,7 @@ class DouyinParser(PluginBase):
             "Referer": "https://www.douyin.com/",
             "Cookie": f"__ac_nonce={nonce}; __ac_signature={signature}",
         }
-        async with session.get(page_url, headers=headers) as response:
+        async with session.get(page_url, headers=headers, cookies={}) as response:
             if response.status != 200:
                 raise VideoParserError(f"抖音作品页失败，状态码: {response.status}")
             html_content = await response.text()
@@ -426,9 +437,14 @@ class DouyinParser(PluginBase):
             covers = video.get("coverUrlList") or []
             cover = covers[0] if covers and isinstance(covers[0], str) else ""
         author = detail.get("authorInfo") or {}
+        video_id = str(video.get("uri") or "").strip()
+        play_url = (
+            f"https://aweme.snssdk.com/aweme/v1/play/?video_id={video_id}&ratio=720p&line=0"
+            if video_id else html.unescape(video_url)
+        )
         return {
             "kind": "video",
-            "url": html.unescape(video_url),
+            "url": play_url,
             "title": cls._clean_text(detail.get("desc")),
             "author": cls._clean_text(author.get("nickname")),
             "cover": html.unescape(cover),
